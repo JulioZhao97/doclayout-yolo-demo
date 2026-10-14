@@ -1,0 +1,37 @@
+# MinerU Stage1: offline indexed annotations + online Ceph images.
+path: /mnt/shared-storage-user/mineru2-shared/zhaozhiyuan/yolov12-doclayout-mineru/data/processed/stage1_train_v1
+train: splits/docgroup_10k_v1/train.u64
+val: splits/docgroup_10k_v1/val.u64
+
+stage1_manifest: /mnt/shared-storage-user/mineru2-shared/zhaozhiyuan/yolov12-doclayout-mineru/data/processed/stage1_train_v1/manifest.json
+stage1_train_index: /mnt/shared-storage-user/mineru2-shared/zhaozhiyuan/yolov12-doclayout-mineru/data/processed/stage1_train_v1/splits/docgroup_10k_v1/train.u64
+stage1_val_index: /mnt/shared-storage-user/mineru2-shared/zhaozhiyuan/yolov12-doclayout-mineru/data/processed/stage1_train_v1/splits/docgroup_10k_v1/val.u64
+stage1_petrel_conf: /mnt/shared-storage-user/mineru2-shared/zhaozhiyuan/yolov12-doclayout-mineru/third_party/MinerU-SWIFT/mineru_ext/configs/petreloss.conf
+stage1_cycle_epochs: 1       # about 2.04M primary train samples per short epoch
+stage1_seed: 260902
+stage1_read_retries: 3
+stage1_retry_delay: 0.2
+
+names:
+  0: text
+  1: title
+  2: header
+  3: footer
+  4: page_number
+  5: image
+  6: image_caption
+  7: image_footnote
+  8: image_block
+  9: table
+  10: table_caption
+  11: table_footnote
+  12: equation
+  13: equation_block
+  14: list
+  15: ref_text
+  16: aside_text
+  17: page_footnote
+  18: code
+  19: code_caption
+  20: algorithm
+  21: phonetic

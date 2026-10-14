@@ -1,0 +1,56 @@
+# MinerU Stage2: offline indexed annotations + online Ceph images.
+#
+# 与 mineru-stage1-full14m.yaml 的唯一差异是 path / 索引指向 stage2 产物；
+# names 与 stage1 **逐字相同**（22 类，顺序一致），因此 stage1 预训练权重的
+# 检测头可以全量继承（Transferred 1340/1340），无需改动模型结构。
+#
+# 数据来源（5 份，共 129,049 页 / 3,556,174 box，2026-10-06 预处理）：
+#   layout_stage2_data_65k_sft_fixtil_fixnl.json              64,954 页
+#   table_img_..._fixcap_32k.FIX5.json (v0408_fix5_bboxnesting) 31,771 页
+#   mergetags_251227_s1sample.json (走 old_image 字段)          24,803 页
+#   layout_stage2_data_sft_0319_5k.json                         4,702 页
+#   layout_stage2_data_sft_0325_2k.json                         2,819 页
+# 已整页丢弃：含 molecular 标注 274 页、零 box 76 页。
+#
+# val 划分：按页均匀采样 5,000 页（稳定哈希 image URI，seed 260902）。
+#
+# 管线：tools/stage2/preprocess_stage2.py（解析 token、过滤、切分）
+#       -> tools/stage1/finalize_stage1_train.py（标签->class_id、rotation->id、去重）原样复用
+# 本 yaml 指向 finalize 之后的 final/ 目录（训练真正读的是这一份）。
+
+path: /mnt/shared-storage-user/mineru2-shared/zhaozhiyuan/yolov12-doclayout-mineru/data/processed/stage2_train_v1/final
+train: splits/uniform_5k_v1/train.u64
+val: splits/uniform_5k_v1/val.u64
+
+stage1_manifest: /mnt/shared-storage-user/mineru2-shared/zhaozhiyuan/yolov12-doclayout-mineru/data/processed/stage2_train_v1/final/manifest.json
+stage1_train_index: /mnt/shared-storage-user/mineru2-shared/zhaozhiyuan/yolov12-doclayout-mineru/data/processed/stage2_train_v1/final/splits/uniform_5k_v1/train.u64
+stage1_val_index: /mnt/shared-storage-user/mineru2-shared/zhaozhiyuan/yolov12-doclayout-mineru/data/processed/stage2_train_v1/final/splits/uniform_5k_v1/val.u64
+stage1_petrel_conf: /mnt/shared-storage-user/mineru2-shared/zhaozhiyuan/yolov12-doclayout-mineru/third_party/MinerU-SWIFT/mineru_ext/configs/petreloss.conf
+stage1_cycle_epochs: 1 # one full train-index pass per epoch
+stage1_seed: 260902
+stage1_read_retries: 3
+stage1_retry_delay: 0.2
+
+names:
+  0: text
+  1: title
+  2: header
+  3: footer
+  4: page_number
+  5: image
+  6: image_caption
+  7: image_footnote
+  8: image_block
+  9: table
+  10: table_caption
+  11: table_footnote
+  12: equation
+  13: equation_block
+  14: list
+  15: ref_text
+  16: aside_text
+  17: page_footnote
+  18: code
+  19: code_caption
+  20: algorithm
+  21: phonetic

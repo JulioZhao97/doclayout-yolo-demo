@@ -1,0 +1,28 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# COCO 2017 dataset https://cocodataset.org by Microsoft
+# Documentation: https://docs.doclayout_yolo.com/datasets/detect/coco/
+# Example usage: yolo train data=coco.yaml
+# parent
+# ├── doclayout_yolo
+# └── datasets
+#     └── coco  ← downloads here (20.1 GB)
+
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+path: ./prima-lad # dataset root dir
+train: train.txt # train images (relative to 'path') 118287 images
+val: val.txt
+test: val.txt # 20288 of 40670 images, submit to https://competitions.codalab.org/competitions/20794
+
+# Classes
+names:
+  0: figure
+  1: table
+  2: paragraph
+  3: header
+  4: page-number
+  5: floating
+  6: caption
+  7: credit
+  8: drop-capital
+  9: heading
+  10: footer

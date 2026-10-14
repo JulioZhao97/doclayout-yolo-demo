@@ -1,0 +1,460 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+"""MinerU Stage1 streaming dataset backed by offline JSONL indexes and online Ceph images."""
+
+from __future__ import annotations
+
+import bisect
+import configparser
+import json
+import math
+import os
+import random
+import sys
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch.distributed as dist
+from torch.utils.data import Sampler
+
+from ultralytics.data.dataset import YOLODataset
+from ultralytics.utils import LOGGER
+
+
+class Stage1RecordStore:
+    """Random-access reader for preprocessed Stage1 JSONL shards and uint64 offset indexes."""
+
+    def __init__(self, manifest_path):
+        self.manifest_path = Path(manifest_path).expanduser().resolve()
+        with self.manifest_path.open(encoding="utf-8") as f:
+            self.manifest = json.load(f)
+
+        shards = self.manifest.get("shards", [])
+        if not shards:
+            raise ValueError(f"No shards found in Stage1 manifest: {self.manifest_path}")
+
+        self.shards = []
+        expected_start = 0
+        for shard in shards:
+            start = int(shard.get("global_start", expected_start))
+            records = int(shard["records"])
+            end = int(shard.get("global_end_exclusive", start + records))
+            if start != expected_start or end - start != records:
+                raise ValueError(f"Non-contiguous or invalid Stage1 shard range: {shard}")
+            records_path = self._resolve(shard["records_path"])
+            index_path = self._resolve(shard["index_path"])
+            if not records_path.is_file() or not index_path.is_file():
+                raise FileNotFoundError(f"Missing Stage1 shard files: {records_path}, {index_path}")
+            expected_index_bytes = (records + 1) * np.dtype("<u8").itemsize
+            if index_path.stat().st_size != expected_index_bytes:
+                raise ValueError(
+                    f"Bad Stage1 index size for {index_path}: expected {expected_index_bytes}, "
+                    f"got {index_path.stat().st_size}"
+                )
+            self.shards.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "records": records_path,
+                    "index": index_path,
+                }
+            )
+            expected_start = end
+
+        manifest_total = int(self.manifest.get("totals", {}).get("records", expected_start))
+        if manifest_total != expected_start:
+            raise ValueError(f"Manifest total {manifest_total} does not match shard total {expected_start}")
+        self.total_records = expected_start
+        self._ends = [x["end"] for x in self.shards]
+        self._index_maps = {}
+        self._record_fds = {}
+
+    def _resolve(self, value):
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else (self.manifest_path.parent / path).resolve()
+
+    def __len__(self):
+        return self.total_records
+
+    def __getitem__(self, index):
+        if index < 0:
+            index += self.total_records
+        if index < 0 or index >= self.total_records:
+            raise IndexError(index)
+
+        shard_id = bisect.bisect_right(self._ends, index)
+        shard = self.shards[shard_id]
+        local_index = index - shard["start"]
+        offsets = self._index_maps.get(shard_id)
+        if offsets is None:
+            offsets = np.memmap(shard["index"], dtype="<u8", mode="r")
+            self._index_maps[shard_id] = offsets
+        start, end = int(offsets[local_index]), int(offsets[local_index + 1])
+
+        fd = self._record_fds.get(shard_id)
+        if fd is None:
+            fd = os.open(shard["records"], os.O_RDONLY)
+            self._record_fds[shard_id] = fd
+        payload = os.pread(fd, end - start, start).rstrip(b"\r\n")
+        try:
+            return json.loads(payload)
+        except Exception as e:
+            raise ValueError(f"Invalid JSON in global Stage1 record {index}") from e
+
+    def close(self):
+        for fd in self._record_fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._record_fds.clear()
+        self._index_maps.clear()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_record_fds"] = {}
+        state["_index_maps"] = {}
+        return state
+
+    def __del__(self):
+        self.close()
+
+
+class Stage1CephReader:
+    """Lazy, per-process Petrel client using the same prefix rules as MinerU-SWIFT."""
+
+    def __init__(self, conf_path, retries=3, retry_delay=0.2):
+        self.conf_path = str(Path(conf_path).expanduser().resolve())
+        self.retries = max(int(retries), 1)
+        self.retry_delay = float(retry_delay)
+        self._client = None
+        self._boto_clients = {}
+
+    @staticmethod
+    def client_path(uri):
+        if uri.startswith(("mineru:", "doc_store:")):
+            return uri
+        return ("doc_store:" if uri.startswith("s3://doc-store") else "mineru:") + uri
+
+    def _get_client(self):
+        if self._client is None:
+            try:
+                from petrel_client.client import Client
+            except ImportError as e:
+                raise ImportError(
+                    "petrel_client is required for MinerU Stage1 image loading; use the MinerU training image"
+                ) from e
+            self._client = Client(conf_path=self.conf_path)
+        return self._client
+
+    @staticmethod
+    def _import_boto3():
+        # Some MinerU images keep boto3 in system Python while torch lives in a shared Conda environment.
+        candidates = (
+            Path(f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages"),
+            Path(f"/usr/lib/python{sys.version_info.major}/dist-packages"),
+            Path("/usr/lib/python3/dist-packages"),
+        )
+        for path in candidates:
+            if path.is_dir() and str(path) not in sys.path:
+                sys.path.append(str(path))
+        import boto3
+        from botocore.config import Config
+
+        return boto3, Config
+
+    def _get_boto_client(self, section):
+        client = self._boto_clients.get(section)
+        if client is not None:
+            return client
+        parser = configparser.RawConfigParser()
+        if not parser.read(self.conf_path) or not parser.has_section(section):
+            raise ValueError(f"Missing [{section}] in Petrel config: {self.conf_path}")
+        endpoint = parser.get(section, "host_base")
+        if not endpoint.startswith(("http://", "https://")):
+            endpoint = "http://" + endpoint
+        boto3, Config = self._import_boto3()
+        client = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=parser.get(section, "access_key"),
+            aws_secret_access_key=parser.get(section, "secret_key"),
+            config=Config(signature_version="s3v4", s3={"addressing_style": "path"}, retries={"max_attempts": 1}),
+        )
+        self._boto_clients[section] = client
+        return client
+
+    def _get_with_boto(self, uri):
+        from urllib.parse import urlsplit
+
+        raw_uri = uri.split(":", 1)[1] if uri.startswith(("mineru:", "doc_store:")) else uri
+        parsed = urlsplit(raw_uri)
+        if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.lstrip("/"):
+            raise ValueError(f"Invalid Stage1 S3 URI: {uri}")
+        section = "doc_store" if parsed.netloc == "doc-store" else "mineru"
+        response = self._get_boto_client(section).get_object(Bucket=parsed.netloc, Key=parsed.path.lstrip("/"))
+        return response["Body"].read()
+
+    def get(self, uri):
+        last_error = None
+        for attempt in range(self.retries):
+            try:
+                try:
+                    payload = self._get_client().get(self.client_path(uri))
+                except ImportError:
+                    payload = self._get_with_boto(uri)
+                if payload is None:
+                    raise FileNotFoundError(uri)
+                return payload
+            except Exception as e:
+                last_error = e
+                self._client = None
+                self._boto_clients.clear()
+                if attempt + 1 < self.retries:
+                    time.sleep(self.retry_delay * (2**attempt))
+        raise OSError(f"Failed to read Stage1 image after {self.retries} attempts: {uri}") from last_error
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_client"] = None
+        state["_boto_clients"] = {}
+        return state
+
+
+class Stage1EpochSampler(Sampler):
+    """Deterministic affine-permutation sampler with bounded, DDP-safe epochs."""
+
+    def __init__(
+        self,
+        dataset_size,
+        *,
+        seed=0,
+        shuffle=True,
+        cycle_epochs=7,
+        samples_per_epoch=None,
+        rank=None,
+        num_replicas=None,
+    ):
+        if dataset_size <= 0:
+            raise ValueError("dataset_size must be positive")
+        self.dataset_size = int(dataset_size)
+        self.seed = int(seed)
+        self.shuffle = bool(shuffle)
+        self.epoch = 0
+
+        if num_replicas is None:
+            num_replicas = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        if rank is None:
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        if self.num_replicas <= 0 or not 0 <= self.rank < self.num_replicas:
+            raise ValueError(f"Invalid distributed sampler rank {self.rank}/{self.num_replicas}")
+
+        if samples_per_epoch is not None:
+            self.samples_per_epoch = min(max(int(samples_per_epoch), 1), self.dataset_size)
+            self.cycle_epochs = math.ceil(self.dataset_size / self.samples_per_epoch)
+        else:
+            self.samples_per_epoch = None
+            self.cycle_epochs = min(max(int(cycle_epochs), 1), self.dataset_size)
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def _slice(self):
+        epoch_in_cycle = self.epoch % self.cycle_epochs
+        cycle = self.epoch // self.cycle_epochs
+        if self.samples_per_epoch is not None:
+            start = epoch_in_cycle * self.samples_per_epoch
+            length = min(self.samples_per_epoch, self.dataset_size - start)
+        else:
+            base, remainder = divmod(self.dataset_size, self.cycle_epochs)
+            start = epoch_in_cycle * base + min(epoch_in_cycle, remainder)
+            length = base + int(epoch_in_cycle < remainder)
+        return cycle, start, length
+
+    def _affine(self, cycle):
+        if not self.shuffle:
+            return 1, 0
+        rng = random.Random(self.seed + 0x9E3779B1 * cycle)
+        multiplier = rng.randrange(1, self.dataset_size + 1)
+        while math.gcd(multiplier, self.dataset_size) != 1:
+            multiplier = multiplier % self.dataset_size + 1
+        return multiplier, rng.randrange(self.dataset_size)
+
+    def __iter__(self):
+        cycle, start, length = self._slice()
+        multiplier, offset = self._affine(cycle)
+        per_rank = math.ceil(length / self.num_replicas)
+        for k in range(per_rank):
+            # Modulo only pads the final distributed step, matching DistributedSampler semantics.
+            position = start + (self.rank + k * self.num_replicas) % length
+            yield (multiplier * position + offset) % self.dataset_size
+
+    def __len__(self):
+        return math.ceil(self._slice()[2] / self.num_replicas)
+
+
+class Stage1Dataset(YOLODataset):
+    """YOLO detection dataset that keeps annotations on disk and images in Ceph."""
+
+    streaming_labels = True
+
+    def __init__(
+        self,
+        *,
+        manifest_path,
+        petrel_conf,
+        mode="train",
+        img_path=None,
+        imgsz=640,
+        cache=False,
+        augment=True,
+        hyp=None,
+        prefix="",
+        rect=False,
+        batch_size=16,
+        stride=32,
+        pad=0.5,
+        single_cls=False,
+        classes=None,
+        fraction=1.0,
+        data=None,
+        task="detect",
+    ):
+        if task != "detect":
+            raise ValueError("MinerU Stage1 currently supports task='detect' only")
+        self.store = Stage1RecordStore(manifest_path)
+        self.image_reader = Stage1CephReader(
+            petrel_conf,
+            retries=(data or {}).get("stage1_read_retries", 3),
+            retry_delay=(data or {}).get("stage1_retry_delay", 0.2),
+        )
+        self.mode = mode
+        self.data = data or {}
+        manifest_classes = self.store.manifest.get("classes")
+        data_names = self.data.get("names")
+        if manifest_classes and data_names:
+            expected = {int(k): str(v) for k, v in manifest_classes.items()}
+            configured = {int(k): str(v) for k, v in data_names.items()}
+            if expected != configured:
+                raise ValueError("Stage1 manifest classes do not match data YAML names")
+        self.img_path = img_path
+        self.imgsz = int(imgsz)
+        self.augment = bool(augment)
+        self.single_cls = bool(single_cls)
+        self.include_classes = None if classes is None else np.asarray(classes, dtype=np.int64)
+        self.prefix = prefix
+        self.fraction = float(fraction)
+        self.ni = max(1, min(len(self.store), round(len(self.store) * self.fraction)))
+        self.rect = False
+        self.batch_size = int(batch_size or 1)
+        self.stride = int(stride)
+        self.pad = float(pad)
+        self.cache = None
+        self.buffer = []
+        self.max_buffer_length = min(self.ni, self.batch_size * 8, 1000) if self.augment else 0
+        self.im_files = ()  # Do not materialize 14M URI strings in RAM.
+        self.use_segments = False
+        self.use_keypoints = False
+        self.use_obb = False
+        if rect:
+            LOGGER.warning(f"{self.prefix}MinerU Stage1 uses rect=False because image shapes are loaded online")
+        if cache:
+            LOGGER.warning(f"{self.prefix}MinerU Stage1 ignores cache={cache!r}; images remain online in Ceph")
+        self.transforms = self.build_transforms(hyp=hyp)
+        LOGGER.info(
+            f"{self.prefix}MinerU Stage1: {self.ni:,} indexed records, online Ceph images, "
+            f"{(data or {}).get('stage1_cycle_epochs', 7)} epochs per coverage cycle"
+        )
+
+    def __len__(self):
+        return self.ni
+
+    def build_sampler(self, rank=-1, shuffle=True):
+        samples = self.data.get("stage1_samples_per_epoch") if self.mode == "train" else self.data.get(
+            "stage1_val_samples", min(10000, self.ni)
+        )
+        return Stage1EpochSampler(
+            self.ni,
+            seed=self.data.get("stage1_seed", 0),
+            shuffle=shuffle,
+            cycle_epochs=self.data.get("stage1_cycle_epochs", 7),
+            samples_per_epoch=samples,
+        )
+
+    def _decode_image(self, uri):
+        payload = self.image_reader.get(uri)
+        image = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError(f"Failed to decode Stage1 image: {uri}")
+        return image
+
+    def load_image(self, index, rect_mode=True):
+        record = self.store[index]
+        image = self._decode_image(record["u"])
+        h0, w0 = image.shape[:2]
+        if rect_mode:
+            ratio = self.imgsz / max(h0, w0)
+            if ratio != 1:
+                w = min(math.ceil(w0 * ratio), self.imgsz)
+                h = min(math.ceil(h0 * ratio), self.imgsz)
+                image = cv2.resize(image, (w, h), interpolation=cv2.INTER_LINEAR)
+        elif not (h0 == w0 == self.imgsz):
+            image = cv2.resize(image, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+        self._remember(index)
+        return image, (h0, w0), image.shape[:2]
+
+    def _remember(self, index):
+        if self.augment:
+            self.buffer.append(index)
+            if len(self.buffer) > self.max_buffer_length:
+                self.buffer.pop(0)
+
+    def get_image_and_label(self, index):
+        record = self.store[index]
+        uri = record["u"]
+        image = self._decode_image(uri)
+        h0, w0 = image.shape[:2]
+        ratio = self.imgsz / max(h0, w0)
+        if ratio != 1:
+            w = min(math.ceil(w0 * ratio), self.imgsz)
+            h = min(math.ceil(h0 * ratio), self.imgsz)
+            image = cv2.resize(image, (w, h), interpolation=cv2.INTER_LINEAR)
+        self._remember(index)
+
+        boxes = np.asarray(record.get("b", ()), dtype=np.float32)
+        if boxes.size:
+            boxes = boxes.reshape(-1, 6)
+            cls = boxes[:, :1]
+            xyxy = np.clip(boxes[:, 1:5] / 1000.0, 0.0, 1.0)
+            if self.include_classes is not None:
+                keep = np.isin(cls[:, 0].astype(np.int64), self.include_classes)
+                cls, xyxy = cls[keep], xyxy[keep]
+            if self.single_cls:
+                cls[:, 0] = 0
+        else:
+            cls = np.zeros((0, 1), dtype=np.float32)
+            xyxy = np.zeros((0, 4), dtype=np.float32)
+
+        label = {
+            "im_file": uri,
+            "img": image,
+            "ori_shape": (h0, w0),
+            "resized_shape": image.shape[:2],
+            "ratio_pad": (image.shape[0] / h0, image.shape[1] / w0),
+            "cls": cls.astype(np.float32, copy=False),
+            "bboxes": xyxy.astype(np.float32, copy=False),
+            "segments": [],
+            "keypoints": None,
+            "normalized": True,
+            "bbox_format": "xyxy",
+        }
+        return self.update_labels_info(label)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["buffer"] = []
+        return state

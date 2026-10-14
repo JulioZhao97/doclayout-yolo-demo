@@ -1,0 +1,12 @@
+# PubLayNet-P robustness evaluation dataset.
+path: ./publaynet_p
+train: images/Warping/Warping_2
+val: images/Warping/Warping_2
+test: images/Warping/Warping_2
+
+names:
+  0: text
+  1: title
+  2: list
+  3: table
+  4: figure

@@ -1,0 +1,11 @@
+gradio>=4.0
+opencv-python-headless
+numpy
+thop
+pyyaml
+tqdm
+requests
+psutil
+pandas
+matplotlib
+pillow

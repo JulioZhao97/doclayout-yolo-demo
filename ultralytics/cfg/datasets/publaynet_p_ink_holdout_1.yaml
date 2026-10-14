@@ -1,0 +1,12 @@
+# PubLayNet-P robustness evaluation dataset.
+path: ./publaynet_p
+train: images/Ink-holdout/Ink-holdout_1
+val: images/Ink-holdout/Ink-holdout_1
+test: images/Ink-holdout/Ink-holdout_1
+
+names:
+  0: text
+  1: title
+  2: list
+  3: table
+  4: figure

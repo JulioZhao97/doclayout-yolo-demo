@@ -1,0 +1,12 @@
+# PubLayNet-P robustness evaluation dataset.
+path: ./publaynet_p
+train: images/Speckle/Speckle_2
+val: images/Speckle/Speckle_2
+test: images/Speckle/Speckle_2
+
+names:
+  0: text
+  1: title
+  2: list
+  3: table
+  4: figure

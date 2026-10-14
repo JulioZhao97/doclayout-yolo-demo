@@ -1,0 +1,12 @@
+# PubLayNet-P robustness evaluation dataset.
+path: ./publaynet_p
+train: images/Texture/Texture_3
+val: images/Texture/Texture_3
+test: images/Texture/Texture_3
+
+names:
+  0: text
+  1: title
+  2: list
+  3: table
+  4: figure

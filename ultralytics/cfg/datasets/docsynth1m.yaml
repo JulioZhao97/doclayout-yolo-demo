@@ -1,0 +1,80 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# COCO 2017 dataset https://cocodataset.org by Microsoft
+# Documentation: https://docs.doclayout_yolo.com/datasets/detect/coco/
+# Example usage: yolo train data=coco.yaml
+# parent
+# ├── doclayout_yolo
+# └── datasets
+#     └── coco  ← downloads here (20.1 GB)
+
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+# path: /mnt/hwfile/opendatalab/zhaozhiyuan/yolov10/D4LA # dataset root dir
+path: ./docsynth1m-1207
+train: train.txt # train images (relative to 'path') 118287 images
+val: val.txt # val images (relative to 'path') 5000 images
+test: val.txt # 20288 of 40670 images, submit to https://competitions.codalab.org/competitions/20794
+
+# Classes
+names:
+  0: 'weather forecast'
+  1: 'translator'
+  2: 'formula'
+  3: 'drop cap'
+  4: 'headline'
+  5: 'dateline'
+  6: 'footnote'
+  7: 'answer'
+  8: 'credit'
+  9: 'footer'
+  10: 'institute'
+  11: 'catalogue'
+  12: 'marginal note'
+  13: 'music'
+  14: 'lead'
+  15: 'algorithm'
+  16: 'folio'
+  17: 'blank'
+  18: 'formula caption'
+  19: 'poem'
+  20: 'underscore'
+  21: 'mugshot'
+  22: 'paragraph'
+  23: 'bill'
+  24: 'correction'
+  25: 'matching'
+  26: 'reference'
+  27: 'advertisement'
+  28: 'story'
+  29: 'byline'
+  30: 'title_all'
+  31: 'flag'
+  32: 'figure'
+  33: 'teasers'
+  34: 'examinee information'
+  35: 'breakout'
+  36: "editor's note"
+  37: 'caption'
+  38: 'table note'
+  39: 'option'
+  40: 'play'
+  41: 'index'
+  42: 'part'
+  43: 'author'
+  44: 'keyword'
+  45: 'barcode'
+  46: 'table caption'
+  47: 'table'
+  48: 'kicker'
+  49: 'QR code'
+  50: 'header'
+  51: 'endnote'
+  52: 'page number'
+  53: 'jump line'
+  54: 'bracket'
+  55: 'supplementary note'
+  56: 'Checkbox'
+  57: 'sidebar'
+  58: 'sealing line'
+  59: 'code'
+  60: 'inside'
+  61: 'list'

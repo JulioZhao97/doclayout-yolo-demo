@@ -1,0 +1,12 @@
+# PubLayNet-P robustness evaluation dataset.
+path: ./publaynet_p
+train: images/Ink-bleeding/Ink-bleeding_3
+val: images/Ink-bleeding/Ink-bleeding_3
+test: images/Ink-bleeding/Ink-bleeding_3
+
+names:
+  0: text
+  1: title
+  2: list
+  3: table
+  4: figure
