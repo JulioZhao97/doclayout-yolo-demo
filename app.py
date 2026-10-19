@@ -9,6 +9,31 @@ import gradio as gr
 from ultralytics import YOLO
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.pt")
+
+
+def _resolve_lfs_pointer(path):
+    """Git checkouts without git-lfs leave a pointer text file; pull the real weights."""
+    with open(path, "rb") as f:
+        head = f.read(64)
+    if not head.startswith(b"version https://git-lfs"):
+        return
+    print("[demo] best.pt is a Git LFS pointer, pulling real weights ...", flush=True)
+    import subprocess
+    root = os.path.dirname(path)
+    r = subprocess.run(["git", "lfs", "pull", "--include", "best.pt"], cwd=root,
+                       capture_output=True, text=True)
+    ok = not os.path.getsize(path) < 1000 and not open(path, "rb").read(20).startswith(b"version")
+    if r.returncode != 0 or not ok:
+        raise RuntimeError(
+            "best.pt is a Git LFS pointer and 'git lfs pull' failed:\n"
+            + (r.stderr or r.stdout or "git-lfs not available")
+            + "\nFix: upload best.pt via the Space web file manager (not git), "
+              "or push with git-lfs installed."
+        )
+    print("[demo] best.pt restored from LFS.", flush=True)
+
+
+_resolve_lfs_pointer(MODEL_PATH)
 MODEL = YOLO(MODEL_PATH)
 
 CLASS_NAMES = [
@@ -28,11 +53,11 @@ PALETTE = [
 
 
 def _chip(img, text, x, y, color, th):
-    """Label chip: white core, class-colored border and text, placed above the box top-left."""
+    """detectron2-style label: solid class-color bar with white text, above the box top-left."""
     fs = max(0.42, 0.0005 * max(img.shape[:2]))
-    ft = max(1, th)
+    ft = 1
     (tw, th_), _bl = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, ft)
-    pad = max(2, th + 1)
+    pad = max(2, th)
     chip_h = th_ + _bl + 2 * pad
     chip_w = tw + 2 * pad
     cy1 = y - chip_h - 1
@@ -40,23 +65,31 @@ def _chip(img, text, x, y, color, th):
         cy1 = min(y + 1, img.shape[0] - chip_h)
     cx1 = max(0, min(x, img.shape[1] - chip_w - 1))
     cv2.rectangle(img, (cx1, cy1), (cx1 + chip_w, cy1 + chip_h), color, -1)
-    cv2.rectangle(img, (cx1 + th, cy1 + th), (cx1 + chip_w - th, cy1 + chip_h - th), (255, 255, 255), -1)
-    cv2.rectangle(img, (cx1, cy1), (cx1 + chip_w, cy1 + chip_h), color, th)
+    # white text on dark chips, black text on light ones
+    luminance = 0.299 * color[2] + 0.587 * color[1] + 0.114 * color[0]
+    tcolor = (0, 0, 0) if luminance > 150 else (255, 255, 255)
     cv2.putText(img, text, (cx1 + pad, cy1 + chip_h - pad - _bl),
-                cv2.FONT_HERSHEY_SIMPLEX, fs, color, ft, cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX, fs, tcolor, ft, cv2.LINE_AA)
 
 
 def detect(img, conf, nms_iou):
     if img is None:
-        return None, ""
+        return None
     img = img[:, :, ::-1].copy()  # RGB -> BGR
-    res = MODEL.predict(img, imgsz=1280, conf=float(conf), iou=float(nms_iou),
+    res = MODEL.predict(img, imgsz=1024, conf=float(conf), iou=float(nms_iou),
                         verbose=False)[0]
     boxes = res.boxes
     lw = max(1, round(0.0012 * max(img.shape[:2])))
     out = img.copy()
-    lines = []
     order = np.argsort(-boxes.conf.cpu().numpy()) if len(boxes) else []
+    # detectron2-style: translucent color fill (drawn on an overlay, alpha ~0.35)
+    overlay = out.copy()
+    for i in order:
+        c = int(boxes.cls[i])
+        x1, y1, x2, y2 = [int(v) for v in boxes.xyxy[i].tolist()]
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), PALETTE[c % len(PALETTE)], -1)
+    cv2.addWeighted(overlay, 0.35, out, 0.65, 0, dst=out)
+    # thin border + label chip on top of the fill
     for i in order:
         c = int(boxes.cls[i])
         conf_v = float(boxes.conf[i])
@@ -64,9 +97,7 @@ def detect(img, conf, nms_iou):
         color = PALETTE[c % len(PALETTE)]
         cv2.rectangle(out, (x1, y1), (x2, y2), color, lw)
         _chip(out, f"{CLASS_NAMES[c]} {conf_v:.2f}", x1, y1, color, lw)
-        lines.append(f"{CLASS_NAMES[c]}  {conf_v:.2f}")
-    summary = f"检测到 {len(lines)} 个目标" + ("：\n" + "\n".join(lines) if lines else "")
-    return out[:, :, ::-1], summary
+    return out[:, :, ::-1]
 
 
 demo = gr.Interface(
@@ -78,11 +109,8 @@ demo = gr.Interface(
     ],
     outputs=[
         gr.Image(type="numpy", label="检测结果"),
-        gr.Textbox(label="目标列表", lines=8),
     ],
-    title="DocLayout-YOLO 文档版面分析 Demo",
-    description="上传文档页面图像，模型输出 22 类版面元素的检测框（按类别着色）。"
-                "当前权重：MinerU stage2 微调 ft-v1 best（mAP50-95 0.58345）。",
+    title="DocLayout-YOLO: Axis-Attentive Document Layout Detector with Mesh-Guided Synthetic Pretraining",
     examples=[],
     flagging_mode="never",
 )
